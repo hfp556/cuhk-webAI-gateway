@@ -1,5 +1,6 @@
 param(
-    [switch]$InitializeOnly
+    [switch]$InitializeOnly,
+    [switch]$New
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,6 +22,27 @@ function Initialize-CuhkCodexHome {
             [Text.UTF8Encoding]::new($false)
         )
     }
+}
+
+function Test-CuhkCodexHistory([string]$Directory) {
+    # The native resume picker filters sessions by their recorded working
+    # directory, so an empty picker means this folder has no history yet.
+    $sessions = Join-Path $codexHome 'sessions'
+    if (-not (Test-Path -LiteralPath $sessions -PathType Container)) { return $false }
+    $wanted = $Directory.TrimEnd('\')
+    $files = Get-ChildItem -LiteralPath $sessions -Recurse -File -Filter '*.jsonl' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 200
+    foreach ($file in $files) {
+        try {
+            $reader = [IO.File]::OpenText($file.FullName)
+            try { $head = $reader.ReadLine() } finally { $reader.Close() }
+        } catch { continue }
+        if ($head -and $head -match '"cwd":"((?:[^"\\]|\\.)*)"') {
+            $recorded = ($Matches[1] -replace '\\\\', '\').TrimEnd('\')
+            if ($recorded -ieq $wanted) { return $true }
+        }
+    }
+    return $false
 }
 
 function Enable-CuhkGateway {
@@ -50,11 +72,24 @@ try {
     }
 
     Write-Host 'Starting CUHK Gateway...' -ForegroundColor Cyan
-    & $gatewayCommand start | Out-Host
+    # No pipeline here: the gateway daemons inherit this console's stdout, and a
+    # pipeline to a cmdlet would wait for an end-of-stream that never arrives.
+    & $gatewayCommand start
     if ($LASTEXITCODE -ne 0) { throw "CUHK Gateway failed to start (exit code $LASTEXITCODE)." }
 
-    Write-Host 'Opening this folder''s Gateway CLI sessions...' -ForegroundColor Cyan
-    & $codexCommand resume
+    $currentDirectory = [string](Get-Location)
+    if ($New) {
+        Write-Host 'Starting a new conversation in this folder...' -ForegroundColor Cyan
+        & $codexCommand
+    } elseif (Test-CuhkCodexHistory $currentDirectory) {
+        Write-Host 'Opening this folder''s Gateway CLI sessions...' -ForegroundColor Cyan
+        & $codexCommand resume
+    } else {
+        # Without history the native picker shows an empty list and the window
+        # looks broken, so start the first conversation in this folder instead.
+        Write-Host 'This folder has no saved conversation yet, starting a new one.' -ForegroundColor Yellow
+        & $codexCommand
+    }
     exit $LASTEXITCODE
 } catch {
     Write-Host "Launch failed: $($_.Exception.Message)" -ForegroundColor Red

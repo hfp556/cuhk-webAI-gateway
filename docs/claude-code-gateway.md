@@ -4,7 +4,7 @@ Claude Code and Codex share the CUHK provider runtime and authenticated OpenCLI 
 
 ## Launch
 
-Open this checkout's `CUHK-AI-Settings.cmd`, choose a working directory/model/thinking level, and use **启动 Gateway Codex CLI** or **启动 Gateway Claude Code CLI**. Both buttons save settings, start Gateway and open a terminal in the selected directory. Claude starts a fresh interactive session even with no history; its native `/resume` command selects previous sessions. Codex retains its native cwd-filtered `resume` picker.
+Open this checkout's `CUHK-AI-Settings.cmd`, choose a working directory/model/thinking level, and use **开始新对话（Codex）**, **继续上次对话（Codex）** or **改用 Claude Code 对话**. Every button saves settings, starts Gateway and opens a terminal in the selected directory. The model and thinking level chosen in the panel are the upstream selection; the CLI-side model name is only a routing alias. Claude starts a fresh interactive session even with no history; its native `/resume` command selects previous sessions. Codex keeps its native cwd-filtered `resume` picker, and falls back to a new conversation when the selected folder has no history yet.
 
 ```powershell
 .\bin\cuhk-codex-launch.cmd

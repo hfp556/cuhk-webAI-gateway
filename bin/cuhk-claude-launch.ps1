@@ -15,7 +15,9 @@ try {
         Move-Item -Force -LiteralPath "$configPath.tmp" -Destination $configPath
     }
     if ($InitializeOnly) { Write-Host "Initialization complete: $claudeHome"; exit 0 }
-    & (Join-Path $PSScriptRoot 'cuhk-gateway.cmd') start | Out-Host
+    # No pipeline here: the gateway daemons inherit this console's stdout, and a
+    # pipeline to a cmdlet would wait for an end-of-stream that never arrives.
+    & (Join-Path $PSScriptRoot 'cuhk-gateway.cmd') start
     if ($LASTEXITCODE -ne 0) { throw 'CUHK Gateway failed to start.' }
     # Start a fresh interactive session even when this cwd has no history.
     # Claude's /resume picker remains available inside the native CLI.

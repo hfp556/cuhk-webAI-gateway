@@ -70,7 +70,63 @@ class SettingsLaunchTests(unittest.TestCase):
         self.assertIn(str(settings_app.CLAUDE_LAUNCHER), popen.call_args.args[0])
         self.assertNotIn(str(settings_app.CODEX_LAUNCHER), popen.call_args.args[0])
 
-    def test_both_launch_buttons_fit_the_panel(self) -> None:
+    def test_new_conversation_button_asks_for_a_new_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(settings_app.subprocess, "Popen") as popen:
+            app = self.make_app(directory)
+            app.launch_gateway_codex_new()
+
+        command = popen.call_args.args[0]
+        self.assertIn(str(settings_app.CODEX_LAUNCHER), command)
+        self.assertEqual(command[-1], "-New")
+        self.assertEqual(popen.call_args.kwargs["cwd"], directory)
+
+    @mock.patch.object(settings_app.subprocess, "run")
+    def test_stop_button_stops_the_gateway(self, run: mock.Mock) -> None:
+        run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+        app = settings_app.SettingsApp.__new__(settings_app.SettingsApp)
+        app.status = FakeVar("")
+        app.root = mock.Mock()
+
+        app.stop_gateway()
+
+        self.assertEqual(run.call_args.args[0], [str(settings_app.GATEWAY), "stop"])
+        self.assertIn("已停止", app.status.value)
+
+    def test_layout_measurements_follow_the_display_scale(self) -> None:
+        app = settings_app.SettingsApp.__new__(settings_app.SettingsApp)
+        app.scale = 1.5
+
+        self.assertEqual(app.px(100), 150)
+
+    def test_model_check_reports_an_unavailable_model(self) -> None:
+        app = settings_app.SettingsApp.__new__(settings_app.SettingsApp)
+        app.model_label = FakeVar(settings_app.MODELS["glm5.3flash"]["label"])
+        app.status = FakeVar("")
+        app.root = mock.Mock()
+        failure = mock.Mock(
+            returncode=1,
+            stdout="",
+            stderr="error:\n  message: GLM 5.3 Flash was not found in the model dialog.\n",
+        )
+        with mock.patch.object(settings_app.SettingsApp, "_run", return_value=failure):
+            app.check_selected_model()
+
+        self.assertIn("不可用", app.status.value)
+        self.assertIn("not found", app.status.value)
+
+    def test_model_check_reports_an_available_model(self) -> None:
+        app = settings_app.SettingsApp.__new__(settings_app.SettingsApp)
+        app.model_label = FakeVar(settings_app.MODELS["glm5.3flash"]["label"])
+        app.status = FakeVar("")
+        app.root = mock.Mock()
+        success = mock.Mock(returncode=0, stdout="ok: true", stderr="")
+        with mock.patch.object(settings_app.SettingsApp, "_run", return_value=success):
+            app.check_selected_model()
+
+        self.assertIn("可用", app.status.value)
+
+    def test_all_launch_buttons_fit_the_panel(self) -> None:
         root = settings_app.tk.Tk()
         self.addCleanup(root.destroy)
         with mock.patch.object(settings_app, "load_config", return_value=settings_app.default_config()):
@@ -83,10 +139,12 @@ class SettingsLaunchTests(unittest.TestCase):
             for child in widget.winfo_children():
                 visit(child)
         visit(root)
-        launches = [b for b in buttons if "启动 Gateway" in b.cget("text")]
-        self.assertEqual(len(launches), 2)
+        labels = {"开始新对话（Codex）", "继续上次对话（Codex）", "改用 Claude Code 对话"}
+        launches = [b for b in buttons if b.cget("text") in labels]
+        self.assertEqual(len(launches), 3)
+        bottom = root.winfo_rooty() + root.winfo_height()
         for button in launches:
-            self.assertLessEqual(button.winfo_rooty() + button.winfo_height(), root.winfo_rooty() + root.winfo_height())
+            self.assertLessEqual(button.winfo_rooty() + button.winfo_height(), bottom)
 
     def test_launcher_uses_native_current_directory_session_filter(self) -> None:
         launcher = settings_app.CODEX_LAUNCHER.read_text(encoding="utf-8")

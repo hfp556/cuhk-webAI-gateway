@@ -55,7 +55,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1
 
 1. 在 Chrome 中安装 OpenCLI 的解压扩展，并自行登录 `https://ai.cuhk.edu.cn`。
 2. 双击仓库根目录的 `CUHK-AI-Settings.cmd`，选择工作目录、模型和思考强度。
-3. 点击 **启动 Gateway Codex CLI** 或 **启动 Gateway Claude Code CLI**。
+3. 在面板里选好模型、思考强度与工作目录，点击 **开始新对话（Codex）**、**继续上次对话（Codex）** 或 **改用 Claude Code 对话**。所选文件夹还没有历史对话时，Codex 会自动开始新对话，不会停在空列表上。
 
 也可以在仓库根目录调用现有启动器：
 

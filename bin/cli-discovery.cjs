@@ -18,7 +18,12 @@ function codexExecutable(environment = process.env) {
   const desktop = environment.LOCALAPPDATA && path.join(environment.LOCALAPPDATA, "OpenAI/Codex/bin");
   const installed = nativeExecutables(desktop).sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
   if (installed.length) return installed[0];
-  for (const directory of (environment.PATH || "").split(path.delimiter).filter(Boolean)) {
+  const directories = (environment.PATH || "").split(path.delimiter).filter(Boolean);
+  // A per-user Node.js install writes its global CLI shims outside the PATH of a
+  // shell that was already running when that PATH changed; search it as well.
+  const perUserPrefix = environment.LOCALAPPDATA && path.join(environment.LOCALAPPDATA, "Programs/nodejs");
+  if (perUserPrefix && !directories.includes(perUserPrefix)) directories.push(perUserPrefix);
+  for (const directory of directories) {
     const direct = path.join(directory, "codex.exe");
     if (fs.existsSync(direct)) return direct;
     // npm shims cannot be spawned safely with multiline arguments. Locate the

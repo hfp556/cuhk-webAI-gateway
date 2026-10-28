@@ -6,7 +6,7 @@ const { parseToolCall } = require("./protocol.cjs");
 
 const DECISION_VERSION = 1;
 const DECISION_ENVELOPE = /^\s*<agent_decision>\s*([\s\S]*?)\s*<\/agent_decision>([\s\S]*)$/u;
-const FENCED_DECISION = /^\s*```([a-zA-Z0-9_-]*)[ \t]*\r?\n([\s\S]*?)\r?\n```([\s\S]*)$/u;
+const FENCED_DECISION = /^\s*(`{3,})([a-zA-Z0-9_-]*)[ \t]*\r?\n([\s\S]*?)\r?\n\1([\s\S]*)$/u;
 const DECISION_FENCE_LANGUAGES = new Set(["cuhk-decision", "cuhk_decision", "agent_decision"]);
 const MAX_REASON_CHARS = 2000;
 const MAX_FEEDBACK_CHARS = 4000;
@@ -37,10 +37,48 @@ function normalizeEvidence(value) {
   return value.map((item, index) => boundedString(item, `evidence[${index}]`, MAX_EVIDENCE_CHARS, true));
 }
 
+function firstJsonObjectEnd(text) {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') { inString = true; continue; }
+    if (char === "{") depth += 1;
+    else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+function parseDecisionObject(payload) {
+  const cleaned = cleanDecisionPayload(payload);
+  try { return JSON.parse(cleaned); }
+  catch {
+    // Huge hand-composed tool payloads occasionally gain one stray closing
+    // brace at the boundary. Recover the first complete JSON object only when
+    // the remaining text is exactly that one brace; any other trailing text is
+    // still rejected. Catalog/schema validation runs on the recovered object.
+    const end = firstJsonObjectEnd(cleaned);
+    const rest = end >= 0 ? cleaned.slice(end + 1).trim() : "";
+    if (end < 0 || (rest !== "" && rest !== "}")) {
+      throw new ProtocolError("Agent decision envelope contains invalid JSON.");
+    }
+    try { return JSON.parse(cleaned.slice(0, end + 1)); }
+    catch { throw new ProtocolError("Agent decision envelope contains invalid JSON."); }
+  }
+}
+
 function parseDecisionJson(payload) {
-  let value;
-  try { value = JSON.parse(cleanDecisionPayload(payload)); }
-  catch { throw new ProtocolError("Agent decision envelope contains invalid JSON."); }
+  const value = parseDecisionObject(payload);
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new ProtocolError("Agent decision envelope must contain a JSON object.");
   }
@@ -71,31 +109,58 @@ function parseAgentDecision(text, tools, options = {}) {
     trailing = envelope[2].trim();
   } else {
     const fenced = FENCED_DECISION.exec(raw);
-    if (fenced && isDecisionFence(fenced[1], fenced[2])) {
-      payload = fenced[2];
-      trailing = fenced[3].trim();
+    if (fenced && isDecisionFence(fenced[2], fenced[3])) {
+      payload = fenced[3];
+      trailing = fenced[4].trim();
     }
   }
   if (payload === undefined) {
-    if (/<\/?agent(?:\\)?_decision>|```(?:cuhk-decision|cuhk_decision|agent_decision)/u.test(raw)) {
+    if (/<\/?agent(?:\\)?_decision>|`{3,}(?:cuhk-decision|cuhk_decision|agent_decision)/u.test(raw)) {
       throw new ProtocolError("Assistant produced a malformed AGENT DECISION PROTOCOL v1 envelope.");
     }
     return null;
   }
 
   const value = parseDecisionJson(payload);
-  const reason = boundedString(value.reason, "reason", MAX_REASON_CHARS, true);
+  if (value.decision === "tool" && value.arguments && typeof value.arguments === "object" && !Array.isArray(value.arguments)) {
+    // Web models sometimes nest the diagnostic reason inside arguments; move
+    // it out so a strict tool schema (additionalProperties:false) still accepts
+    // the command instead of rejecting the whole turn.
+    if (value.reason === undefined && typeof value.arguments.reason === "string") {
+      value.reason = value.arguments.reason;
+    }
+    delete value.arguments.reason;
+  }
+  // `reason` is diagnostic for a tool request; the command and schema are what
+  // execute. Web models sometimes omit it on a duplicated/truncated block, so a
+  // tool decision defaults instead of failing before the tool can run.
+  const reasonRequired = value.decision !== "tool";
+  const reason = boundedString(value.reason, "reason", MAX_REASON_CHARS, reasonRequired) || "tool request";
   const gatewayFeedback = boundedString(value.gateway_feedback, "gateway_feedback", MAX_FEEDBACK_CHARS);
   const evidence = normalizeEvidence(value.evidence);
 
   if (value.decision === "tool") {
-    if (trailing) throw new ProtocolError("A tool decision cannot include trailing answer text.");
     if (typeof value.name !== "string" || !value.name.trim()) throw new ProtocolError("A tool decision requires name.");
     if (!value.arguments || typeof value.arguments !== "object" || Array.isArray(value.arguments)) {
       throw new ProtocolError("A tool decision requires an arguments object.");
     }
     const parsed = parseToolCall(`<tool_call>${JSON.stringify({ name: value.name, arguments: value.arguments })}</tool_call>`, tools, options);
-    return { kind: "tool", parsed, reason, evidence, gatewayFeedback, explicit: true };
+    // Web models sometimes append a blocked decision or an apology after an
+    // otherwise valid tool request. The tool request is already validated
+    // against the catalog, so execute it and ignore the trailing text instead
+    // of discarding a real action over a cosmetic protocol violation. The
+    // runtime records ignoredTrailingText for diagnostics.
+    const additionalToolDecisions = /`{3,}[\s\S]*?"decision"\s*:\s*"tool"/u.test(trailing);
+    return {
+      kind: "tool",
+      parsed,
+      reason,
+      evidence,
+      gatewayFeedback,
+      explicit: true,
+      ignoredTrailingText: trailing.length > 0,
+      additionalToolDecisions
+    };
   }
 
   const answer = trailing || boundedString(value.answer, "answer", 256 * 1024);
@@ -122,7 +187,7 @@ function isDecisionFence(language, payload) {
   // Accept a generic whole-response fence only when its JSON positively
   // identifies this protocol; legacy {name, arguments} blocks remain tools.
   try {
-    const value = JSON.parse(cleanDecisionPayload(payload).replace(/\\_/gu, "_"));
+    const value = parseDecisionObject(String(payload).replace(/\\_/gu, "_"));
     return value?.version === DECISION_VERSION && ["tool", "final", "blocked"].includes(value?.decision);
   } catch {
     return false;
@@ -150,6 +215,10 @@ function decisionProtocolPrompt(profile = {}, options = {}) {
       "```cuhk-decision",
       '{"version":1,"decision":"tool","name":"工具名","arguments":{},"reason":"仍需该操作的原因"}',
       "```",
+      "如果决定调用工具，回复中只能有这一个工具决策块；不要同时输出 blocked、final、道歉或其他文字。环境里的 permission profile 只描述客户端沙箱，不会移除工具目录中的工具。",
+      "每轮只能有一个工具决策块；不要在同一回复里重复或并列多个工具块，后续调用等结果返回后再发。",
+      "写入较大文件时，分多次工具调用追加（单次内容约 4KB），避免一个巨大的 heredoc；写完用 wc -c 或 sed -n 验证。",
+      "读取 DOCX/PDF 等二进制文件时，优先用 pandoc、libreoffice 或 unzip；命令失败时先读错误并换一种方式重试，不要直接 blocked。",
       "final：先输出决策代码块，随后直接写给用户的最终答复；最终答复中的命令、代码块和手动步骤只是文档，不会被 Gateway 当工具执行：",
       "```cuhk-decision",
       '{"version":1,"decision":"final","reason":"goal_satisfied","evidence":["真实证据"],"gateway_feedback":"如 Gateway 判断错误可在此指出"}',
@@ -172,6 +241,10 @@ function decisionProtocolPrompt(profile = {}, options = {}) {
     "```cuhk-decision",
     '{"version":1,"decision":"tool","name":"tool_name","arguments":{},"reason":"why this operation is still needed"}',
     "```",
+    "If you decide to call a tool, the tool decision must be the only content of the reply: do not also output blocked, final, an apology, or any other text. A permission profile in the environment only describes the client sandbox; it never removes a tool from the catalog.",
+    "Emit exactly one tool decision per reply; do not duplicate or batch several tool blocks. Send the next call only after the previous result arrives.",
+    "For large files, append in several tool calls (roughly 4KB each) instead of one huge heredoc, then verify with wc -c or sed.",
+    "For binary documents (DOCX/PDF), use pandoc, libreoffice, or unzip; read a failed command's error and retry instead of blocking.",
     "final (write the user-facing answer after the decision block; code blocks there are documentation and are never executed):",
     "```cuhk-decision",
     '{"version":1,"decision":"final","reason":"goal_satisfied","evidence":["real evidence"],"gateway_feedback":"optional correction of a Gateway assumption"}',

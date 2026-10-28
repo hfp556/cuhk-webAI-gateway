@@ -13,15 +13,19 @@ const TOOL_ENVELOPE = /^\s*<tool(?:\\)?_call>\s*([\s\S]*?)\s*<\/tool(?:\\)?_call
 // Some school models (notably GLM 5.3 Flash) will not emit a raw <tool_call>
 // envelope, but will emit exactly one fenced JSON block when that is the
 // documented tool-request form. Accept only a whole-response json/text block.
-const FENCED_TOOL_ENVELOPE = /^\s*```(?:json|text|cuhk_tool_call)[ \t]*\r?\n([\s\S]*?)\r?\n```\s*$/u;
+// The school renderer lengthens a fence when the payload itself contains
+// triple backticks (for example a Markdown document with ```cpp examples).
+// Accept any fence of at least three backticks and require the closing fence
+// to match the opening length.
+const FENCED_TOOL_ENVELOPE = /^\s*(`{3,})(?:json|text|cuhk_tool_call)[ \t]*\r?\n([\s\S]*?)\r?\n\1\s*$/u;
 // Dedicated model parsers additionally accept the first *valid* fenced JSON
 // block even when the model adds a short sentence before or after it.
-const FENCED_TOOL_BLOCK = /```(?:json|text|cuhk_tool_call)[ \t]*\r?\n([\s\S]*?)\r?\n```/gu;
+const FENCED_TOOL_BLOCK = /(`{3,})(?:json|text|cuhk_tool_call)[ \t]*\r?\n([\s\S]*?)\r?\n\1/gu;
 // GLM often refuses the tool JSON but is happy to emit a complete PowerShell
 // script. In GLM mode the gateway may treat that script as an implicit
 // exec_command request and let the Gateway runtime run exactly the script GLM produced.
-const FENCED_SCRIPT_BLOCK = /```(?:powershell|pwsh|ps1|shell|bash|sh)[ \t]*\r?\n([\s\S]*?)\r?\n```/giu;
-const FENCED_SCRIPT_ENVELOPE = /^\s*```(?:powershell|pwsh|ps1|shell|bash|sh)[ \t]*\r?\n([\s\S]*?)\r?\n```\s*$/iu;
+const FENCED_SCRIPT_BLOCK = /(`{3,})(?:powershell|pwsh|ps1|shell|bash|sh)[ \t]*\r?\n([\s\S]*?)\r?\n\1/giu;
+const FENCED_SCRIPT_ENVELOPE = /^\s*(`{3,})(?:powershell|pwsh|ps1|shell|bash|sh)[ \t]*\r?\n([\s\S]*?)\r?\n\1\s*$/iu;
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -187,9 +191,9 @@ const SHORT_TOOL_PRESENTATIONS = Object.freeze({
   functions__exec_command: Object.freeze({
     protocolName: "exec_command",
     aliases: ["functions__exec_command"],
-    description: "在用户的 Windows 电脑上通过 Gateway 运行时执行一条 PowerShell 命令并返回输出。用于创建、读取、修改文件，或运行命令。你负责决定调用，运行时负责执行。",
+    description: "在用户电脑上通过 Gateway 运行时执行一条 shell 命令并返回输出。用于创建、读取、修改文件，或运行命令。你负责决定调用，运行时负责执行。",
     properties: {
-      cmd: "要执行的 PowerShell 命令。",
+      cmd: "要执行的 shell 命令。",
       yield_time_ms: "首次最多等待 10000 毫秒，之后返回进程 session_id；用 write_stdin 继续读取，禁止重复启动。",
       max_output_tokens: "最多返回的输出 token 数。"
     }
@@ -202,7 +206,7 @@ const SHORT_TOOL_PRESENTATIONS = Object.freeze({
   functions__apply_patch: Object.freeze({
     protocolName: "apply_patch",
     aliases: ["functions__apply_patch"],
-    description: "通过 Gateway 运行时的 apply_patch 在工作区内创建、修改或删除文件。对于 Desktop 等绝对路径，请使用 exec_command。",
+    description: "通过 Gateway 运行时的 apply_patch 在工作区内创建、修改或删除文件。工作区外的绝对路径请使用 exec_command。",
     properties: { patch: "完整的 apply_patch 内容。" }
   }),
   functions__wait: Object.freeze({
@@ -219,7 +223,7 @@ const SHORT_TOOL_PRESENTATIONS = Object.freeze({
   virtual_apply_patch: Object.freeze({
     protocolName: "apply_patch",
     aliases: ["virtual_apply_patch"],
-    description: "通过 Gateway 运行时的 apply_patch 在工作区内创建、修改或删除文件。对于 Desktop 等绝对路径，请使用 exec_command。",
+    description: "通过 Gateway 运行时的 apply_patch 在工作区内创建、修改或删除文件。工作区外的绝对路径请使用 exec_command。",
     properties: { patch: "完整的 apply_patch 内容。" }
   })
 });
@@ -301,7 +305,7 @@ function compactSchema(schema) {
 
 function toolExample(tool) {
   const name = tool?.name || "tool_name";
-  if (name === "exec_command") return JSON.stringify({ name, arguments: { cmd: "<PowerShell command>" } });
+  if (name === "exec_command") return JSON.stringify({ name, arguments: { cmd: "<shell command>" } });
   if (name === "apply_patch") return JSON.stringify({ name, arguments: { patch: "<complete apply_patch payload>" } });
   if (name === "wait") return JSON.stringify({ name, arguments: { cell_id: "<cell_id>" } });
   return JSON.stringify({ name, arguments: {} });
@@ -497,7 +501,7 @@ function parseToolCall(text, tools, options = {}) {
     let firstError = null;
     for (const match of raw.matchAll(FENCED_TOOL_BLOCK)) {
       try {
-        return parseToolPayload(match[1], tools);
+        return parseToolPayload(match[2], tools);
       } catch (error) {
         if (error instanceof ProtocolError && !firstError) firstError = error;
       }
@@ -508,8 +512,8 @@ function parseToolCall(text, tools, options = {}) {
         ? [wholeScript]
         : (!options.scriptStrict && options.allowScriptCommentary ? [...raw.matchAll(FENCED_SCRIPT_BLOCK)] : []);
       for (const match of scriptMatches) {
-        const language = /```(\w+)/.exec(match[0])?.[1] || "powershell";
-        const parsedScript = parseScriptPayload(match[1], tools, language);
+        const language = /`{3,}(\w+)/.exec(match[0])?.[1] || "powershell";
+        const parsedScript = parseScriptPayload(match[2], tools, language);
         if (parsedScript) return parsedScript;
       }
     }
@@ -522,7 +526,7 @@ function parseToolCall(text, tools, options = {}) {
     if (looksLikeToolAttempt(raw)) throw new ProtocolError("Assistant produced a malformed TOOL PROTOCOL v1 envelope.");
     return null;
   }
-  return parseToolPayload(fenced[1], tools);
+  return parseToolPayload(fenced[2], tools);
 }
 
 function validateValue(value, schema, path, depth) {

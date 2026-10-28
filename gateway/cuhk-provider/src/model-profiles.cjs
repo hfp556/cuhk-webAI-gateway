@@ -110,6 +110,10 @@ const GPT6_LUNA_PROFILE = Object.freeze({
   parserStyle: "gpt6-luna",
   dedicatedJsonTools: true,
   compactWebPrompt: true,
+  // The full JSON catalog makes GPT 6 Luna refuse local tool use; a short
+  // decision contract keeps the same protocol while staying under the page's
+  // refusal threshold. Runtime and tool validation are unchanged.
+  compactToolContract: true,
   scriptBridge: false
 });
 

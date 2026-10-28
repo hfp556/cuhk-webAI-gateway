@@ -23,6 +23,8 @@ On a tool-capable turn the preferred response begins with exactly one decision e
 
 A `tool` decision block is the whole response. The fence is required because the school page's Markdown renderer can otherwise rewrite `$`, backslashes, and underscores inside commands. Gateway validates the name and arguments against the actual catalog before exposing a client-native call.
 
+Web models sometimes append a second `blocked` decision, an apology, or other prose after an otherwise valid tool request. Gateway executes the **first** explicit tool request and ignores the trailing text (logged as `tool_decision_with_trailing_text`). The trailing content is never interpreted as a second dispatch, and the tool still passes catalog and schema validation, so a cosmetic protocol violation cannot discard a real action. The preferred form remains a standalone tool block.
+
 The renderer may relabel an unknown `cuhk-decision` info string as `text`. A whole-response generic fence is therefore accepted only when its JSON positively contains `version: 1` and a valid `decision`; ordinary legacy `{name, arguments}` JSON remains on the tool compatibility path.
 
 The page has also been observed appending its internal `</arg_value>` marker immediately after otherwise valid decision JSON. The parser strips that exact marker only at the payload boundary. It does not rewrite JSON fields or command text, and normal catalog/schema validation still follows.
@@ -87,6 +89,7 @@ Conversation ownership is a prerequisite for bidirectional checking. A new task 
 6. Disagreement without progress is bounded and terminates visibly.
 7. Legacy formats never take precedence over a valid explicit decision.
 8. No bootstrap or continuation is written until its conversation identity is verified.
+9. The first explicit `tool` decision wins over trailing prose; trailing text is ignored and logged, never executed.
 
 ## Completion-summary regression
 

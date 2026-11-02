@@ -3,7 +3,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const { ProtocolError } = require("../src/errors.cjs");
-const { adaptToolsForModel, normalizeTools } = require("../src/protocol.cjs");
+const { adaptToolsForModel, normalizeTools, parseToolCall } = require("../src/protocol.cjs");
 const { GLM_PROFILE } = require("../src/model-profiles.cjs");
 const {
   actionFingerprint,
@@ -35,6 +35,23 @@ test("agent decision tool validates against the real catalog", () => {
   assert.deepEqual(decision.parsed.arguments, { value: "ok" });
   assert.equal(decision.reason, "need evidence");
   assert.match(actionFingerprint(decision.parsed), /^[a-f0-9]{24}$/u);
+});
+
+test("a reason nested inside arguments is moved out before validation", () => {
+  const decision = parseAgentDecision(
+    '```cuhk-decision\n{"version":1,"decision":"tool","name":"echo","arguments":{"value":"ok","reason":"nested"}}\n```',
+    tools
+  );
+  assert.equal(decision.kind, "tool");
+  assert.equal(decision.reason, "nested");
+  assert.deepEqual(decision.parsed.arguments, { value: "ok" });
+});
+
+test("multiple tool blocks are flagged so the runtime can warn the model", () => {
+  const text = '```cuhk-decision\n{"version":1,"decision":"tool","name":"echo","arguments":{"value":"ok"},"reason":"first"}\n```\n\n```cuhk-decision\n{"version":1,"decision":"tool","name":"echo","arguments":{"value":"ok"},"reason":"second"}\n```';
+  const decision = parseAgentDecision(text, tools);
+  assert.equal(decision.kind, "tool");
+  assert.equal(decision.additionalToolDecisions, true);
 });
 
 test("agent decision final preserves markdown and manual code as answer text", () => {
@@ -120,14 +137,43 @@ test("malformed and invalid decisions fail before any tool execution", () => {
     () => parseAgentDecision('<agent_decision>{"version":1,"decision":"tool","name":"echo","arguments":{"value":"bad"},"reason":"needed"}</agent_decision>', tools),
     /not an allowed enum/u
   );
-  assert.throws(
-    () => parseAgentDecision('<agent_decision>{"version":1,"decision":"tool","name":"echo","arguments":{"value":"ok"}}</agent_decision> trailing', tools),
-    /reason is required/u
+  const noReason = parseAgentDecision(
+    '<agent_decision>{"version":1,"decision":"tool","name":"echo","arguments":{"value":"ok"}}</agent_decision> trailing',
+    tools
   );
-  assert.throws(
-    () => parseAgentDecision('<agent_decision>{"version":1,"decision":"tool","name":"echo","arguments":{"value":"ok"},"reason":"needed"}</agent_decision> trailing', tools),
-    /cannot include trailing/u
+  assert.equal(noReason.kind, "tool");
+  assert.equal(noReason.reason, "tool request");
+  assert.equal(noReason.ignoredTrailingText, true);
+  const tolerant = parseAgentDecision(
+    '<agent_decision>{"version":1,"decision":"tool","name":"echo","arguments":{"value":"ok"},"reason":"needed"}</agent_decision> trailing',
+    tools
   );
+  assert.equal(tolerant.kind, "tool");
+  assert.equal(tolerant.ignoredTrailingText, true);
+  assert.deepEqual(tolerant.parsed.arguments, { value: "ok" });
+  // The web model sometimes emits a valid tool request followed by a blocked
+  // decision and an apology. The tool must still execute; the trailing
+  // decision is documentation, not a second dispatch.
+  const hedged = parseAgentDecision(
+    '```text\n{"version":1,"decision":"tool","name":"echo","arguments":{"value":"ok"},"reason":"read"}\n```\n\n```text\n{"version":1,"decision":"blocked","reason":"no tool"}\n```\n\n抱歉，我没有拿到输出。',
+    tools
+  );
+  assert.equal(hedged.kind, "tool");
+  assert.equal(hedged.ignoredTrailingText, true);
+});
+
+test("variable-length fences and a stray trailing brace are recovered", () => {
+  const payload = '{"version":1,"decision":"tool","name":"echo","arguments":{"value":"ok"},"reason":"large write"}';
+  const decision = parseAgentDecision("````text\n" + payload + "}\n````", tools);
+  assert.equal(decision.kind, "tool");
+  assert.deepEqual(decision.parsed.arguments, { value: "ok" });
+
+  const toolJson = parseToolCall(
+    '````json\n{"name":"echo","arguments":{"value":"ok"}}\n````',
+    tools,
+    { style: "glm" }
+  );
+  assert.equal(toolJson.tool.protocolName, "echo");
 });
 
 test("decision protocol states the authority split and right to reject Gateway control", () => {

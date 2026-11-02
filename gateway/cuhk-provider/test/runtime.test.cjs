@@ -136,6 +136,18 @@ test("two sequential tool calls and a tool error can complete", async () => {
   assert.match(transport.calls[2].prompt, /ERROR: deliberate failure/);
 });
 
+test("a reply with multiple tool blocks warns after executing only the first", async () => {
+  const twoBlocks = '```cuhk-decision\n{"version":1,"decision":"tool","name":"echo","arguments":{"value":"a"},"reason":"first"}\n```\n\n```cuhk-decision\n{"version":1,"decision":"tool","name":"echo","arguments":{"value":"b"},"reason":"second"}\n```';
+  const { instance, transport } = runtime([twoBlocks, "first block handled"]);
+  const first = await instance.respond({ input: "two blocks", tools: [echoTool] });
+  assert.equal(first.output[0].type, "function_call");
+  await instance.respond({
+    input: [{ type: "function_call_output", call_id: first.output[0].call_id, output: "a" }]
+  });
+  assert.match(transport.calls[1].prompt, /Only the first block was executed/u);
+  assert.match(transport.calls[1].prompt, /Issue the next tool block by itself/u);
+});
+
 test("explicit agent decisions drive a tool and then an unwrapped final answer", async () => {
   const { instance, transport } = runtime([
     '<agent_decision>{"version":1,"decision":"tool","name":"echo","arguments":{"value":"a"},"reason":"need evidence"}</agent_decision>',

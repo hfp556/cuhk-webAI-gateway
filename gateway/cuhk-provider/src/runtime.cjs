@@ -378,6 +378,7 @@ class CuhkProviderRuntime {
     session.profile = modelProfile(session.model);
     const hasIncomingTools = body.tools !== undefined || additionalTools.length > 0;
     const completedTool = session.pending;
+    const skippedToolBlocks = completedTool?.additionalToolDecisions === true;
     let toolOutput = null;
     try {
       const output = JSON.parse(result.output);
@@ -442,6 +443,9 @@ class CuhkProviderRuntime {
       return this.createPendingToolCall(session, pollTool, { session_id: runningSessionId }, config, true);
     }
     const prompt = buildToolResultPrompt(result, session.catalog, catalogChanged, session.profile)
+      + (skippedToolBlocks
+        ? "\nNOTE: Your previous reply contained more than one tool block. Only the first block was executed; the others were ignored. Issue the next tool block by itself after reading this result."
+        : "")
       + (queued.length ? `\nNEW USER INPUT (priority over continuing the old plan):\n${queued.join("\n\n")}\n${statusOnly ? "用户现在只询问进度。依据刚收到的工具结果直接回答；本轮不要再调用工具，不要开始其他命令。" : "先响应最新用户指令，再继续旧任务。"}` : "")
       + "\n" + toolChoiceInstruction(statusOnly ? "none" : body.tool_choice, session.profile, session.catalog.normalized);
     return this.runModelTurn(session, prompt, false, config, () => {
@@ -521,6 +525,11 @@ class CuhkProviderRuntime {
           })
         };
       decision = parseAgentDecision(upstream.text, session.tools, parseOptions);
+      if (decision?.kind === "tool" && decision.ignoredTrailingText) {
+        // The model hedged after a valid tool request. The request is still
+        // executed; keep a privacy-safe diagnostic instead of failing the turn.
+        this.log({ event: "tool_decision_with_trailing_text", sessionId: session.id });
+      }
       if (decision?.kind === "tool") parsed = decision.parsed;
       else if (!decision) {
         parsed = parseToolCall(upstream.text, session.tools, parseOptions);
@@ -566,7 +575,8 @@ class CuhkProviderRuntime {
         polling,
         parsed.argumentJson,
         parsed.synthetic === "script",
-        fingerprint
+        fingerprint,
+        decision?.additionalToolDecisions === true
       );
     }
 
@@ -634,7 +644,7 @@ class CuhkProviderRuntime {
     );
   }
 
-  createPendingToolCall(session, tool, argumentsValue, config, polling = false, argumentJson = JSON.stringify(argumentsValue), synthetic = false, fingerprint = null) {
+  createPendingToolCall(session, tool, argumentsValue, config, polling = false, argumentJson = JSON.stringify(argumentsValue), synthetic = false, fingerprint = null, additionalToolDecisions = false) {
     if ((!polling && session.loopCount >= config.maxToolLoops) || (polling && (session.pollCount || 0) >= 256)) {
       this.finishSession(session);
       throw new ProtocolError(polling ? "Process poll limit (256) reached." : `Tool loop limit (${config.maxToolLoops}) reached.`);
@@ -642,7 +652,7 @@ class CuhkProviderRuntime {
     if (polling) session.pollCount = (session.pollCount || 0) + 1;
     else session.loopCount += 1;
     const callId = `call_${crypto.randomBytes(12).toString("hex")}`;
-    session.pending = { callId, tool, arguments: argumentsValue, argumentJson, synthetic, actionFingerprint: fingerprint || actionFingerprint({ tool, argumentJson }) };
+    session.pending = { callId, tool, arguments: argumentsValue, argumentJson, synthetic, additionalToolDecisions, actionFingerprint: fingerprint || actionFingerprint({ tool, argumentJson }) };
     session.pendingSince = this.now();
     this.pendingCalls.set(callId, session.id);
     return createToolResponse({
@@ -817,13 +827,42 @@ function localSystemMetadataResponse(history) {
   return characters.length <= limit ? subject : characters.slice(0, limit).join("").trim();
 }
 
+// GPT6-Luna-class web models refuse local tool use when the full JSON catalog
+// is inlined: the long policy-shaped prompt trips their "cannot access your
+// computer" refusal. Keep the same decision protocol but compress the contract
+// to the tool names, one example, and a platform-neutral local-access rule.
+function compactDecisionContract(catalog, profile = {}) {
+  const names = catalog.normalized.map((tool) => tool.name).join(", ");
+  const negative = profile.toolPromptStyle === "gemini"
+    ? "Do not emit Gemini/Google native function-call syntax; this gateway accepts only the fenced JSON block below."
+    : profile.toolPromptStyle.startsWith("gpt6-")
+      ? "Do not emit OpenAI native function-call objects; this CUHK bridge accepts only the fenced JSON block below."
+      : "";
+  return [
+    `CUHK TOOL PROTOCOL v1 - ${profile.toolPromptStyle.toUpperCase()} MODE`,
+    `catalog_fingerprint: ${catalog.fingerprint}`,
+    "你是用户电脑上的主 Agent，通过 CUHK Gateway 执行本地操作。用户的任务可能需要读取或修改本地文件。",
+    `可用工具：${names}`,
+    "需要本地命令或文件时，只输出一个 cuhk-decision 代码块，不要解释，不要要求用户上传文件：",
+    "每轮只能有一个工具决策块；不要在同一回复里重复或并列多个工具块，后续调用等结果返回后再发。",
+    "```cuhk-decision",
+    '{"version":1,"decision":"tool","name":"exec_command","arguments":{"cmd":"<shell command>"},"reason":"需要该操作的原因"}',
+    "```",
+    negative,
+    "写入较大文件时，分多次 exec_command 追加（单次命令控制在约 4KB 以内），不要用一个巨大的 heredoc；写完用 wc -c 或 sed -n 验证。",
+    "读取 DOCX/PDF 等二进制文件时，优先用 pandoc、libreoffice 或 unzip；命令失败时先读错误并换一种方式重试，不要直接 blocked。",
+    "收到工具结果后再继续。"
+  ].filter(Boolean).join("\n");
+}
+
 function buildInitialPrompt(instructions, history, catalog, toolChoice, hasTools, profile = {}) {
   if (profile.compactWebPrompt) {
     const task = compactTaskContext(history);
+    const compactContract = hasTools && profile.compactToolContract === true;
     const parts = [
       profile.identityPrompt,
-      hasTools ? decisionProtocolPrompt(profile, { tools: catalog.normalized }) : "",
-      hasTools ? catalog.prompt : "",
+      hasTools && !compactContract ? decisionProtocolPrompt(profile, { tools: catalog.normalized }) : "",
+      hasTools ? (compactContract ? compactDecisionContract(catalog, profile) : catalog.prompt) : "",
       task,
       hasTools ? toolChoiceInstruction(toolChoice, profile, catalog.normalized) : ""
     ];
@@ -846,9 +885,12 @@ function buildInitialPrompt(instructions, history, catalog, toolChoice, hasTools
 function buildDeltaPrompt(newItems, catalog, catalogChanged, toolChoice, hasTools, profile = {}) {
   if (profile.compactWebPrompt) {
     const task = compactTaskContext(newItems) || "继续当前任务；需要本地命令、文件访问或修改时调用目录中的工具。";
-    const protocol = hasTools && catalogChanged
-      ? `${decisionProtocolReminder(profile)}\n\n${catalog.prompt}`
-      : (hasTools ? `${decisionProtocolReminder(profile)}\n\n${toolChoiceAllowsTools(toolChoice) ? compactToolProtocolReminder(catalog, profile) : ""}` : "");
+    const compactContract = hasTools && profile.compactToolContract === true;
+    const protocol = compactContract
+      ? (catalogChanged ? compactDecisionContract(catalog, profile) : compactToolProtocolReminder(catalog, profile))
+      : (hasTools && catalogChanged
+        ? `${decisionProtocolReminder(profile)}\n\n${catalog.prompt}`
+        : (hasTools ? `${decisionProtocolReminder(profile)}\n\n${toolChoiceAllowsTools(toolChoice) ? compactToolProtocolReminder(catalog, profile) : ""}` : ""));
     const parts = [
       profile.identityPrompt,
       protocol,
@@ -896,11 +938,21 @@ function toolProtocolReminder(catalog) {
 }
 
 function compactToolProtocolReminder(catalog, profile = {}) {
+  const names = catalog.normalized.map((tool) => tool.name).join(", ");
+  if (profile.compactToolContract === true) {
+    return [
+      `CUHK TOOL PROTOCOL v1 REMINDER - ${profile.toolPromptStyle.toUpperCase()} MODE`,
+      `catalog_fingerprint: ${catalog.fingerprint}`,
+      "工具目录不变。需要本地操作时，只输出一个 cuhk-decision 工具决策块，不要同时输出 blocked 或解释。",
+      `可用工具：${names}`
+    ].join("\n");
+  }
   if (profile.toolPromptStyle === "glm") {
     return [
       "CUHK TOOL PROTOCOL v1 REMINDER",
       `catalog_fingerprint: ${catalog.fingerprint}`,
-      "工具目录不变；沿用本对话首轮提供的协议和工具定义。"
+      "工具目录不变；沿用本对话首轮提供的协议和工具定义。",
+      `可用工具：${names}`
     ].join("\n");
   }
   if (usesDedicatedJsonTools(profile)) {
@@ -910,7 +962,8 @@ function compactToolProtocolReminder(catalog, profile = {}) {
       `catalog_fingerprint: ${catalog.fingerprint}`,
       english
         ? "Continue as the primary Agent for this conversation; the tool catalog is unchanged. For local operations, output exactly one JSON tool-call code block."
-        : "继续作为当前会话的主 Agent；工具目录不变。需要本地操作时，只输出一个 JSON 工具调用代码块。"
+        : "继续作为当前会话的主 Agent；工具目录不变。需要本地操作时，只输出一个 JSON 工具调用代码块。",
+      english ? `Available tools: ${names}` : `可用工具：${names}`
     ].join("\n");
   }
   return toolProtocolReminder(catalog);
@@ -940,6 +993,7 @@ function buildGatewayControlPrompt(session, reason, detail) {
     tool_choice: choice,
     tool_loops_completed: session.loopCount,
     control_turn: session.arbitrationCount,
+    available_tools: session.tools.map((tool) => tool.protocolName),
     pending_tool: false,
     last_completed_action: session.lastCompletedAction || null
   };
@@ -948,6 +1002,7 @@ function buildGatewayControlPrompt(session, reason, detail) {
       "GATEWAY CONTROL v1（有限仲裁，不是强制继续命令）",
       `Gateway 检测到可能的协议或进度问题：${reason}。下面 facts 是 Gateway 权威范围内的执行状态；对任务是否已完成的语义判断仍由你负责。`,
       "请重新独立判断。你可以通过 gateway_feedback 指出 Gateway 假设错误；若用户目标已满足，应选择 final，而不是迎合本消息追加命令。",
+      "facts.available_tools 列出的工具在本会话中确实可用；不要因为客户端沙箱或 permission profile 就选择 blocked。若决定调用工具，回复中只能有工具决策块，不要同时输出 blocked、final 或道歉。",
       `本轮允许的决策：${allowed.join(", ")}`,
       `facts: ${JSON.stringify(facts)}`
     ]
@@ -955,6 +1010,7 @@ function buildGatewayControlPrompt(session, reason, detail) {
       "GATEWAY CONTROL v1 (bounded arbitration, not an order to continue)",
       `The Gateway detected a possible protocol or progress issue: ${reason}. The facts below are authoritative only for execution state; you still own the semantic judgment of whether the user's goal is complete.`,
       "Re-evaluate independently. Use gateway_feedback to reject a bad Gateway assumption. If the goal is satisfied, choose final instead of inventing another command.",
+      "Every tool named in facts.available_tools is available in this session; do not choose blocked because of the client sandbox or permission profile. If you decide to call a tool, the reply must contain only the tool decision block — no blocked, final, or apology.",
       `Allowed decisions this turn: ${allowed.join(", ")}`,
       `facts: ${JSON.stringify(facts)}`
     ];
